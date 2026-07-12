@@ -164,3 +164,39 @@ LIMIT = 5
 - 终端能打印 `Predicted point` 和准确率统计。
 
 确认没问题后，再把 `LIMIT` 改回 `-1` 跑完整评测。
+
+## 8. 合并 safetensors 模型
+
+仓库里还提供了一个 Hugging Face safetensors 权重线性合并工具：
+
+```text
+tools/merge_hf_safetensors.py
+```
+
+额外依赖：
+
+```bash
+pip install torch safetensors
+```
+
+示例：
+
+```bash
+python tools/merge_hf_safetensors.py \
+  --model-a models/dart-gui-7b \
+  --model-b models/UI-TARS-1.5-7B \
+  --output models/dart-gui-uitars-0.5-0.5 \
+  --weight-a 0.5 \
+  --weight-b 0.5
+```
+
+这个脚本会逐 shard 合并 `model.safetensors.index.json` 对应的权重，不会一次性把完整模型加载到内存。非权重文件，例如 tokenizer、config 等，会从 `--copy-from` 指定的模型目录复制，默认从 `model-a` 复制。
+
+常用参数：
+
+- `--weight-a` / `--weight-b`：两个模型的线性合并权重。
+- `--copy-from a|b`：非权重文件从哪个模型目录复制。
+- `--compute-dtype`：合并时临时计算 dtype，可选 `float32`、`bfloat16`、`float16`。
+- `--output-dtype`：输出权重 dtype，默认 `source`，即保持 `model-a` 的原始 dtype。
+- `--dry-run`：只检查模型结构和 shard 是否兼容，不实际写输出。
+- `--force`：输出目录已存在时强制覆盖。
