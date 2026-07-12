@@ -263,3 +263,88 @@ python eval/run_mind2web_vllm_dart.py
 ```text
 results_dart-7b_mind2web.json
 ```
+
+## 10. AITW 评测
+
+仓库里提供了一个 vLLM / OpenAI API 风格的 AITW DART 评测脚本：
+
+```bash
+python eval/run_aitw_vllm_dart.py
+```
+
+依赖：
+
+```bash
+pip install numpy openai pillow tqdm
+```
+
+数据默认从相对路径 `dataset` 读取，目录结构如下：
+
+```text
+dart_eval/
+  dataset/
+    AITW/
+      metadata/
+        hf_test.json
+        hf_test_with_thoughts.json
+      aitw_images/
+        ...
+```
+
+默认使用 `AITW_VERSION=v2`，会读取：
+
+```text
+dataset/AITW/metadata/hf_test_with_thoughts.json
+```
+
+如果设置 `AITW_VERSION=v1`，会读取：
+
+```text
+dataset/AITW/metadata/hf_test.json
+```
+
+运行示例：
+
+```bash
+MODEL=dart-7b \
+ENDPOINT=http://localhost:8000/v1 \
+AITW_DATASET_DIR=dataset \
+AITW_VERSION=v2 \
+LIMIT=100 \
+NUM_HISTORY=2 \
+AITW_MAX_WORKERS=8 \
+python eval/run_aitw_vllm_dart.py
+```
+
+配置项说明：
+
+- `MODEL`：vLLM 暴露出来的模型名，默认 `dart-7b`。
+- `ENDPOINT`：OpenAI-compatible vLLM 服务地址，默认 `http://localhost:8000/v1`。
+- `AITW_DATASET_DIR`：数据根目录，默认 `dataset`。
+- `AITW_VERSION`：`v1` 或 `v2`，默认 `v2`。
+- `LIMIT`：评测样本数，默认 `-1` 表示全量。
+- `NUM_HISTORY`：使用多少步历史，默认 `2`。
+- `AITW_MAX_WORKERS`：并发请求数，默认 `8`。
+- `TEMPERATURE`：采样温度，默认 `1e-6`。
+- `TOP_K`：采样参数，默认 `50`。
+
+模型输出支持下面的 DART action 格式：
+
+```text
+Action: click(point='<point>x y</point>')
+Action: type(content='...')
+Action: scroll(direction='down')
+Action: press_back()
+Action: press_home()
+Action: press_enter()
+Action: status_task_complete()
+Action: status_task_impossible()
+```
+
+其中 click 的 `x y` 是 resized current screenshot 坐标系。脚本会把它转换成 AITW 评测需要的归一化坐标后计算指标。
+
+输出结果会保存为：
+
+```text
+results_dart-7b_aitw.json
+```
