@@ -4,21 +4,6 @@ from collections import defaultdict
 import numpy as np
 import logging
 try:
-    import wandb
-except ImportError:  # pragma: no cover - depends on user environment
-    class _NoopWandb:
-        def init(self, *args, **kwargs):
-            print("wandb is not installed; logging is disabled.")
-
-        def log(self, *args, **kwargs):
-            pass
-
-        def finish(self):
-            pass
-
-    wandb = _NoopWandb()
-
-try:
     import ray
 except ImportError:  # pragma: no cover - depends on user environment
     ray = None
@@ -373,13 +358,6 @@ def evaluate_dataset(
     Evaluate a specific dataset type (task, website, or domain)
     """
     try:
-        # Initialize wandb for this process
-        wandb.init(
-            project="dart-mind2web-vllm",
-            name=f"{model}-{dataset_name}",
-            group="parallel-eval",
-        )
-
         # Initialize OpenAI client
         client = openai.OpenAI(
             api_key="EMPTY",
@@ -486,16 +464,6 @@ def evaluate_dataset(
             anno_id = item.get("anno_id", str(idx))
             results[split][anno_id].append(step_result)
 
-            # Log step metrics to wandb
-            wandb.log(
-                {
-                    f"{dataset_name}/{split}/step_op_match": float(best_op_match),
-                    f"{dataset_name}/{split}/step_ele_match": float(best_ele_match),
-                    f"{dataset_name}/{split}/step_op_f1": best_op_f1,
-                    "step": idx,
-                }
-            )
-
             print(f"Best prediction: {best_action}")
             print(f"Ground truth: {gt_action}")
             print(f"Op match: {best_op_match}, Ele match: {best_ele_match}, Op F1: {best_op_f1}")
@@ -505,17 +473,12 @@ def evaluate_dataset(
         for split, _ in results.items():
             metrics = calculate_mind2web_metrics(results[split])
 
-            # Log final metrics to wandb
             for metric_name, value in metrics.items():
                 if isinstance(value, list):
-                    # Log each category separately for Operation F1 categories
                     if metric_name == "Operation F1 categories":
                         for i, category in enumerate(["CLICK", "TYPE", "SELECT"]):
-                            wandb.log(
-                                {f"{dataset_name}/{split}/op_f1_{category}": value[i]}
-                            )
+                            final_metrics[f"{dataset_name}/{split}/op_f1_{category}"] = value[i]
                 else:
-                    wandb.log({f"{dataset_name}/{split}/{metric_name}": value})
                     final_metrics[f"{dataset_name}/{split}/{metric_name}"] = value
 
         return final_metrics
@@ -523,10 +486,6 @@ def evaluate_dataset(
     except Exception as e:
         print(f"Error in evaluate_dataset for {dataset_name}: {str(e)}")
         return {f"{dataset_name}/error": str(e)}
-
-    finally:
-        # Always close wandb
-        wandb.finish()
 
 
 def _json_safe(value):
@@ -540,14 +499,13 @@ def _json_safe(value):
 
 
 def main():
-    if os.environ.get("WANDB_API_KEY") is None:
-        print("WANDB_API_KEY is not set; wandb may require login before logging.")
-    os.environ.setdefault('WANDB_DIR', './wandb_log')
     # Configuration
     MODEL = os.environ.get("MODEL", "dart-7b")
     ENDPOINT = os.environ.get("ENDPOINT", "http://localhost:8000/v1")
     DATASET_DIR = os.environ.get("MIND2WEB_DATASET_DIR", "dataset")
-    PROCESSOR_PATH = os.environ.get("MIND2WEB_PROCESSOR", "Bofeee5675/TongUI-32B")
+    PROCESSOR_PATH = os.environ.get("MIND2WEB_PROCESSOR")
+    if not PROCESSOR_PATH:
+        raise ValueError("MIND2WEB_PROCESSOR must be set to a local or Hugging Face processor path.")
     LIMIT = int(os.environ.get("LIMIT", "100"))
     TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
     N_SAMPLING = int(os.environ.get("N_SAMPLING", "1"))
@@ -597,11 +555,6 @@ def main():
         for dataset_metrics in all_metrics:
             if dataset_metrics:  # Check if metrics exist
                 final_metrics.update(dataset_metrics)
-
-        # Initialize main wandb run for final metrics
-        wandb.init(project="dart-mind2web-vllm", name=MODEL)
-        wandb.log(final_metrics)
-        wandb.finish()
 
         with open(f"results_{MODEL}_mind2web.json", "w") as f:
             json.dump(_json_safe(final_metrics), f, indent=4)

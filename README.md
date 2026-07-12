@@ -218,11 +218,10 @@ pip install numpy openai pillow torch transformers qwen-vl-utils
 可选依赖：
 
 ```bash
-pip install ray wandb
+pip install ray
 ```
 
 - 没有 `ray` 时，脚本会顺序评测 `task`、`website`、`domain` 三个 split。
-- 没有 `wandb` 时，脚本会跳过 wandb logging，只保存本地结果 JSON。
 
 数据默认也从相对路径 `dataset` 读取，目录结构如下：
 
@@ -254,7 +253,7 @@ python eval/run_mind2web_vllm_dart.py
 - `MODEL`：vLLM 暴露出来的模型名。
 - `ENDPOINT`：OpenAI-compatible vLLM 服务地址。
 - `MIND2WEB_DATASET_DIR`：数据根目录，默认 `dataset`。
-- `MIND2WEB_PROCESSOR`：用于构造 Mind2Web prompt 和图片输入的 Hugging Face processor，默认 `Bofeee5675/TongUI-32B`。如果机器不能联网，建议设成本地模型或 processor 路径。
+- `MIND2WEB_PROCESSOR`：必填，用于构造 Mind2Web prompt 和图片输入的 Hugging Face processor。可以填本地模型目录，也可以填 Hugging Face repo id。
 - `LIMIT`：每个 split 评测多少条，默认 `100`；设为 `-1` 表示全量。
 - `N_SAMPLING`：每条样本采样次数，默认 `1`。
 - `TOP_K`：采样参数，默认 `50`。
