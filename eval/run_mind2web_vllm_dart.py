@@ -3,8 +3,25 @@ import json
 from collections import defaultdict
 import numpy as np
 import logging
-import wandb
-import ray
+try:
+    import wandb
+except ImportError:  # pragma: no cover - depends on user environment
+    class _NoopWandb:
+        def init(self, *args, **kwargs):
+            print("wandb is not installed; logging is disabled.")
+
+        def log(self, *args, **kwargs):
+            pass
+
+        def finish(self):
+            pass
+
+    wandb = _NoopWandb()
+
+try:
+    import ray
+except ImportError:  # pragma: no cover - depends on user environment
+    ray = None
 from typing import Dict, List, Any
 import os
 import time
@@ -14,9 +31,44 @@ from openai import OpenAIError
 
 import openai
 from transformers.models.auto.processing_auto import AutoProcessor
-from tongui.eval.eval_mind2web_utils import get_bbox, calculate_f1
 
 logging.basicConfig(level=logging.INFO)
+
+
+def calculate_f1(pred, label):
+    pred = set(pred.strip().split())
+    label = set(label.strip().split())
+    if len(pred) == 0 and len(label) == 0:
+        return 1
+    if len(pred) == 0 or len(label) == 0:
+        return 0
+
+    tp = len(pred & label)
+    fp = len(pred - label)
+    fn = len(label - pred)
+    precision = tp / (tp + fp)
+    recall = tp / (tp + fn)
+    if precision == 0 or recall == 0:
+        return 0
+    return 2 * precision * recall / (precision + recall)
+
+
+def get_bbox(meta):
+    image_size = meta["img_size"]
+    action = meta["step"]
+    bbox = [
+        action["bbox"]["x"],
+        action["bbox"]["y"],
+        action["bbox"]["x"] + action["bbox"]["width"],
+        action["bbox"]["y"] + action["bbox"]["height"],
+    ]
+    bbox = [
+        bbox[0] / image_size[0],
+        bbox[1] / image_size[1],
+        bbox[2] / image_size[0],
+        bbox[3] / image_size[1],
+    ]
+    return [round(item, 3) for item in bbox]
 
 
 def round_by_factor(x, factor):
@@ -123,14 +175,16 @@ def _extract_quoted_arg(action_str, names):
     return ""
 
 
-def _scale_point_to_original(point, image_size):
+def _scale_point_to_normalized(point, image_size):
     if not image_size:
-        return [int(point[0]), int(point[1])]
+        return [float(point[0]), float(point[1])]
     img_width, img_height = image_size
     h_resized, w_resized = smart_resize(img_height, img_width)
+    x_original = point[0] * (img_width / w_resized)
+    y_original = point[1] * (img_height / h_resized)
     return [
-        int(point[0] * (img_width / w_resized)),
-        int(point[1] * (img_height / h_resized)),
+        round(x_original / img_width, 3),
+        round(y_original / img_height, 3),
     ]
 
 
@@ -140,9 +194,11 @@ def parse_model_response(response_text, image_size=None):
     Also keeps legacy JSON parsing as a fallback for mixed runs.
     """
     try:
-        parts = response_text.split("\nAction:", 1)
+        parts = response_text.split("Action:", 1)
         thought = parts[0].replace("Thought:", "").strip() if parts else ""
-        action_str = parts[1].strip() if len(parts) == 2 else response_text.strip()
+        if len(parts) != 2:
+            return thought, None
+        action_str = parts[1].strip()
 
         # Legacy TongUI JSON fallback.
         if action_str.startswith("{"):
@@ -151,7 +207,7 @@ def parse_model_response(response_text, image_size=None):
         point = _extract_box_point(action_str)
         if point is None:
             return thought, None
-        point = _scale_point_to_original(point, image_size)
+        point = _scale_point_to_normalized(point, image_size)
 
         action_lower = action_str.lower()
         if action_lower.startswith("type") or "type(" in action_lower or "input" in action_lower:
@@ -302,9 +358,16 @@ def calculate_mind2web_metrics(results):
     return metrics
 
 
-@ray.remote
 def evaluate_dataset(
-    dataset_name: str, model: str, endpoint: str, limit: int = -1, temperature: float = 1, n_sampling: int = 3, top_k: int = 50
+    dataset_name: str,
+    model: str,
+    endpoint: str,
+    dataset_dir: str,
+    processor_path: str,
+    limit: int = -1,
+    temperature: float = 1,
+    n_sampling: int = 3,
+    top_k: int = 50,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific dataset type (task, website, or domain)
@@ -324,11 +387,10 @@ def evaluate_dataset(
         )
 
         # Initialize processor and dataset
-        processor = AutoProcessor.from_pretrained("Bofeee5675/TongUI-32B")
+        processor = AutoProcessor.from_pretrained(processor_path)
         print("Processor settings",
               processor.image_processor.max_pixels,
         )
-        dataset_dir = "/scratch/zhangbofei/Projects/Multimodal-CL/Multimodal-Agent-Tuning/AgentNet/AgentNet/evaluation_data"
         version = "v2"
         dataset_name_full = f"hf_test_{dataset_name}_with_thoughts"
 
@@ -370,18 +432,15 @@ def evaluate_dataset(
             best_ele_match = False
             best_op_f1 = 0.0
             best_action = None
+            gt_action = item["answer"]
+            action2id = {"CLICK": 4, "SELECT": 2, "TYPE": 3}
 
             # Check all predictions and keep the best one
             for action in actions:
-                if action is None:
+                if action is None or action.get("action") not in action2id:
                     continue
 
-
                 # Compare with ground truth
-                gt_action = item["answer"]
-                #HACK
-                if action["action"] != gt_action["action"]:
-                    action["action"] = gt_action["action"]
                 op_match = action["action"] == gt_action["action"]
 
                 # Calculate element match
@@ -392,7 +451,6 @@ def evaluate_dataset(
                 )
 
                 # Calculate operation F1
-                action2id = {"CLICK": 4, "SELECT": 2, "TYPE": 3}
                 action_pred_idx = action2id[action["action"]]
                 pred_str = str(action_pred_idx)
                 if action["action"] in ["TYPE", "SELECT"]:
@@ -411,6 +469,10 @@ def evaluate_dataset(
                     best_ele_match = ele_match
                     best_op_f1 = op_f1
                     best_action = action
+
+            if best_action is None:
+                print(f"Skipping sample {idx} because no prediction could be parsed")
+                continue
 
             # Store results using the best prediction
             step_result = {
@@ -467,32 +529,68 @@ def evaluate_dataset(
         wandb.finish()
 
 
+def _json_safe(value):
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def main():
     if os.environ.get("WANDB_API_KEY") is None:
         print("WANDB_API_KEY is not set; wandb may require login before logging.")
     os.environ.setdefault('WANDB_DIR', './wandb_log')
     # Configuration
-    MODEL = "dart-7b"
-    ENDPOINT = "http://hgx-hyperplane01:8000/v1"
-    LIMIT = 100
-    TEMPERATURE = 1.0
-    N_SAMPLING = 1
-    TOP_K = 50
+    MODEL = os.environ.get("MODEL", "dart-7b")
+    ENDPOINT = os.environ.get("ENDPOINT", "http://localhost:8000/v1")
+    DATASET_DIR = os.environ.get("MIND2WEB_DATASET_DIR", "dataset")
+    PROCESSOR_PATH = os.environ.get("MIND2WEB_PROCESSOR", "Bofeee5675/TongUI-32B")
+    LIMIT = int(os.environ.get("LIMIT", "100"))
+    TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
+    N_SAMPLING = int(os.environ.get("N_SAMPLING", "1"))
+    TOP_K = int(os.environ.get("TOP_K", "50"))
     # Initialize Ray with error handling
     try:
-        ray.init()
-
         # List of dataset types to evaluate
         dataset_types = ["task", "website", "domain"]
 
-        # Launch parallel evaluation tasks
-        futures = []
-        for dataset_type in dataset_types:
-            future = evaluate_dataset.remote(dataset_type, MODEL, ENDPOINT, LIMIT, TEMPERATURE, N_SAMPLING, TOP_K)
-            futures.append(future)
-
-        # Wait for all tasks to complete and collect results
-        all_metrics = ray.get(futures)
+        if ray is not None:
+            ray.init()
+            remote_evaluate = ray.remote(evaluate_dataset)
+            futures = []
+            for dataset_type in dataset_types:
+                future = remote_evaluate.remote(
+                    dataset_type,
+                    MODEL,
+                    ENDPOINT,
+                    DATASET_DIR,
+                    PROCESSOR_PATH,
+                    LIMIT,
+                    TEMPERATURE,
+                    N_SAMPLING,
+                    TOP_K,
+                )
+                futures.append(future)
+            all_metrics = ray.get(futures)
+        else:
+            print("ray is not installed; evaluating dataset types sequentially.")
+            all_metrics = [
+                evaluate_dataset(
+                    dataset_type,
+                    MODEL,
+                    ENDPOINT,
+                    DATASET_DIR,
+                    PROCESSOR_PATH,
+                    LIMIT,
+                    TEMPERATURE,
+                    N_SAMPLING,
+                    TOP_K,
+                )
+                for dataset_type in dataset_types
+            ]
 
         # Combine and log final metrics
         final_metrics = {}
@@ -505,12 +603,16 @@ def main():
         wandb.log(final_metrics)
         wandb.finish()
 
+        with open(f"results_{MODEL}_mind2web.json", "w") as f:
+            json.dump(_json_safe(final_metrics), f, indent=4)
+
     except Exception as e:
         print(f"Error in main: {str(e)}")
 
     finally:
         # Close Ray
-        ray.shutdown()
+        if ray is not None:
+            ray.shutdown()
 
 
 if __name__ == "__main__":

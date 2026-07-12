@@ -200,3 +200,67 @@ python tools/merge_hf_safetensors.py \
 - `--output-dtype`：输出权重 dtype，默认 `source`，即保持 `model-a` 的原始 dtype。
 - `--dry-run`：只检查模型结构和 shard 是否兼容，不实际写输出。
 - `--force`：输出目录已存在时强制覆盖。
+
+## 9. Mind2Web 评测
+
+仓库里也包含 DART 版本的 Mind2Web vLLM 评测脚本：
+
+```bash
+python eval/run_mind2web_vllm_dart.py
+```
+
+Mind2Web 需要额外依赖：
+
+```bash
+pip install numpy openai pillow torch transformers qwen-vl-utils
+```
+
+可选依赖：
+
+```bash
+pip install ray wandb
+```
+
+- 没有 `ray` 时，脚本会顺序评测 `task`、`website`、`domain` 三个 split。
+- 没有 `wandb` 时，脚本会跳过 wandb logging，只保存本地结果 JSON。
+
+数据默认也从相对路径 `dataset` 读取，目录结构如下：
+
+```text
+dart_eval/
+  dataset/
+    Mind2Web/
+      metadata/
+        hf_test_task_with_thoughts.json
+        hf_test_website_with_thoughts.json
+        hf_test_domain_with_thoughts.json
+      ming2web_images/
+        ...
+```
+
+推荐通过环境变量配置模型、服务地址、数据路径和 processor：
+
+```bash
+MODEL=dart-7b \
+ENDPOINT=http://localhost:8000/v1 \
+MIND2WEB_DATASET_DIR=dataset \
+MIND2WEB_PROCESSOR=/path/to/processor_or_model \
+LIMIT=100 \
+python eval/run_mind2web_vllm_dart.py
+```
+
+配置项说明：
+
+- `MODEL`：vLLM 暴露出来的模型名。
+- `ENDPOINT`：OpenAI-compatible vLLM 服务地址。
+- `MIND2WEB_DATASET_DIR`：数据根目录，默认 `dataset`。
+- `MIND2WEB_PROCESSOR`：用于构造 Mind2Web prompt 和图片输入的 Hugging Face processor，默认 `Bofeee5675/TongUI-32B`。如果机器不能联网，建议设成本地模型或 processor 路径。
+- `LIMIT`：每个 split 评测多少条，默认 `100`；设为 `-1` 表示全量。
+- `N_SAMPLING`：每条样本采样次数，默认 `1`。
+- `TOP_K`：采样参数，默认 `50`。
+
+输出结果会保存为：
+
+```text
+results_dart-7b_mind2web.json
+```
