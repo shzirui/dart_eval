@@ -93,33 +93,42 @@ def smart_resize(h, w, factor=IMAGE_FACTOR, min_pixels=MIN_PIXELS, max_pixels=MA
     return h_bar, w_bar
 
 
-DART_SYSTEM_PROMPT = """You are a GUI agent. You are given a web task, action history, and screenshots. You need to perform the next action to complete the task.
+DART_PROMPT_TEMPLATE = """You are a GUI agent. You are given a task and your action history, with screenshots. You need to perform the next action to complete the task.
 
 ## Output Format
-```
-Thought: ...
 Action: ...
-```
+
 
 ## Action Space
-click(start_box='<|box_start|>(x,y)<|box_end|>')
-type(content='...', start_box='<|box_start|>(x,y)<|box_end|>')
-select(option='...', start_box='<|box_start|>(x,y)<|box_end|>')
+click(point='<point>x1 y1</point>')
+type(content='...', point='<point>x1 y1</point>')
+select(option='...', point='<point>x1 y1</point>')
 
 ## Note
-- Use English in `Thought` part.
-- Write a brief plan and summarize your next action with its target element.
 - Coordinates must be in the resized screenshot coordinate system.
+
+## User Instruction {instruction}
 """
+
+
+def _is_legacy_mind2web_prompt(text):
+    return (
+        "You are an assistant trained to navigate the web" in text
+        or "Format the action as a dictionary" in text
+        or "Format the action as a JSON object" in text
+    )
 
 
 def parse_source_to_payload(source):
     """
-    Convert Mind2Web source into a DART-style OpenAI payload.
+    Convert Mind2Web source into a ScreenSpot-Pro-like DART payload.
+    The dataset helper still builds a legacy JSON prompt in source; strip it
+    here and keep only the task, action history, and screenshots.
     Returns messages plus the last screenshot size, since the predicted action is
     applied to the current screenshot.
     """
-    messages = [{"type": "text", "text": DART_SYSTEM_PROMPT}]
+    task = ""
+    history = []
     last_image_size = None
 
     for item in source:
@@ -127,23 +136,36 @@ def parse_source_to_payload(source):
             continue
         for content in item["content"]:
             if content["type"] == "text":
-                messages.append({"type": "text", "text": content["text"]})
+                text = content["text"].strip()
+                if _is_legacy_mind2web_prompt(text):
+                    continue
+                if text.startswith("Task:"):
+                    task = text.split("Task:", 1)[1].strip()
+                    continue
+                history.append({"type": "text", "text": text})
             elif content["type"] == "image":
                 with open(content["image"], "rb") as image_file:
                     encoded_image = base64.b64encode(image_file.read()).decode("utf-8")
                 from PIL import Image
                 with Image.open(content["image"]) as img:
                     last_image_size = img.size  # (width, height)
-                messages.append(
+                history.append(
                     {
                         "type": "image_url",
                         "image_url": {"url": f"data:image/png;base64,{encoded_image}"},
                     }
                 )
+    messages = [{"type": "text", "text": DART_PROMPT_TEMPLATE.format(instruction=task)}]
+    if history:
+        messages.append({"type": "text", "text": "## Action History"})
+        messages.extend(history)
     return messages, last_image_size
 
 
 def _extract_box_point(action_str):
+    match = re.search(r"<point>\s*(-?\d+(?:\.\d+)?)\s+(-?\d+(?:\.\d+)?)\s*</point>", action_str)
+    if match:
+        return [float(match.group(1)), float(match.group(2))]
     match = re.search(r"<\|box_start\|>\s*\(?\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)?\s*<\|box_end\|>", action_str)
     if not match:
         match = re.search(r"\((-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\)", action_str)
