@@ -209,7 +209,10 @@ def parse_model_response(response_text, image_size=None):
 
         # Legacy TongUI JSON fallback.
         if action_str.startswith("{"):
-            return thought, json.loads(action_str)
+            action = json.loads(action_str)
+            if not isinstance(action, dict) or "action" not in action or "position" not in action:
+                return thought, None
+            return thought, action
 
         point = _extract_box_point(action_str)
         if point is None:
@@ -419,76 +422,83 @@ def evaluate_dataset(
             data_dict, item = item
             print(f"\nProcessing {dataset_name} sample {idx + 1}")
 
-            # Get source and make prediction
-            source = item["source"]
-            thoughts, actions = predict_action(client, source, model=model, temperature=temperature, n_sampling=n_sampling, top_k=top_k)
-            
-            if actions is None:
-                print(f"Failed to get predictions for sample {idx}")
-                continue
-
-            # Track best results across all samples
-            best_op_match = False
-            best_ele_match = False
-            best_op_f1 = 0.0
-            best_action = None
-            gt_action = item["answer"]
-            action2id = {"CLICK": 4, "SELECT": 2, "TYPE": 3}
-
-            # Check all predictions and keep the best one
-            for action in actions:
-                if action is None or action.get("action") not in action2id:
+            try:
+                # Get source and make prediction
+                source = item["source"]
+                thoughts, actions = predict_action(client, source, model=model, temperature=temperature, n_sampling=n_sampling, top_k=top_k)
+                
+                if actions is None:
+                    print(f"Failed to get predictions for sample {idx}")
                     continue
 
-                # Compare with ground truth
-                op_match = action["action"] == gt_action["action"]
+                # Track best results across all samples
+                best_op_match = False
+                best_ele_match = False
+                best_op_f1 = 0.0
+                best_action = None
+                gt_action = item["answer"]
+                action2id = {"CLICK": 4, "SELECT": 2, "TYPE": 3}
 
-                # Calculate element match
-                bbox_ref = get_bbox(item)
-                click_point = action["position"]
-                ele_match = (bbox_ref[0] <= click_point[0] <= bbox_ref[2]) and (
-                    bbox_ref[1] <= click_point[1] <= bbox_ref[3]
-                )
+                # Check all predictions and keep the best one
+                for action in actions:
+                    if action is None or action.get("action") not in action2id:
+                        continue
+                    if "position" not in action or not isinstance(action["position"], list) or len(action["position"]) < 2:
+                        print(f"Skipping malformed action without valid position for sample {idx}: {action}")
+                        continue
 
-                # Calculate operation F1
-                action_pred_idx = action2id[action["action"]]
-                pred_str = str(action_pred_idx)
-                if action["action"] in ["TYPE", "SELECT"]:
-                    pred_str += " " + action["value"].lower()
+                    # Compare with ground truth
+                    op_match = action["action"] == gt_action["action"]
 
-                action_ref_idx = action2id[gt_action["action"]]
-                ref_str = str(action_ref_idx)
-                if gt_action["action"] in ["TYPE", "SELECT"]:
-                    ref_str += " " + gt_action["value"].lower()
+                    # Calculate element match
+                    bbox_ref = get_bbox(item)
+                    click_point = action["position"]
+                    ele_match = (bbox_ref[0] <= click_point[0] <= bbox_ref[2]) and (
+                        bbox_ref[1] <= click_point[1] <= bbox_ref[3]
+                    )
 
-                op_f1 = calculate_f1(pred_str, ref_str)
+                    # Calculate operation F1
+                    action_pred_idx = action2id[action["action"]]
+                    pred_str = str(action_pred_idx)
+                    if action["action"] in ["TYPE", "SELECT"]:
+                        pred_str += " " + str(action.get("value", "")).lower()
 
-                # Update best results if this prediction is better
-                if op_f1 > best_op_f1 or (op_f1 == best_op_f1 and ele_match and not best_ele_match):
-                    best_op_match = op_match
-                    best_ele_match = ele_match
-                    best_op_f1 = op_f1
-                    best_action = action
+                    action_ref_idx = action2id[gt_action["action"]]
+                    ref_str = str(action_ref_idx)
+                    if gt_action["action"] in ["TYPE", "SELECT"]:
+                        ref_str += " " + str(gt_action.get("value", "")).lower()
 
-            if best_action is None:
-                print(f"Skipping sample {idx} because no prediction could be parsed")
+                    op_f1 = calculate_f1(pred_str, ref_str)
+
+                    # Update best results if this prediction is better
+                    if op_f1 > best_op_f1 or (op_f1 == best_op_f1 and ele_match and not best_ele_match):
+                        best_op_match = op_match
+                        best_ele_match = ele_match
+                        best_op_f1 = op_f1
+                        best_action = action
+
+                if best_action is None:
+                    print(f"Skipping sample {idx} because no prediction could be parsed")
+                    continue
+
+                # Store results using the best prediction
+                step_result = {
+                    "Op_match": best_op_match,
+                    "Ele_match": best_ele_match,
+                    "Op_F1": [best_op_f1, gt_action["action"]],
+                    "meta": item,
+                }
+
+                split = item.get("split", "unknown")
+                anno_id = item.get("anno_id", str(idx))
+                results[split][anno_id].append(step_result)
+
+                print(f"Best prediction: {best_action}")
+                print(f"Ground truth: {gt_action}")
+                print(f"Op match: {best_op_match}, Ele match: {best_ele_match}, Op F1: {best_op_f1}")
+            except Exception as e:
+                print(f"Skipping sample {idx} due to evaluation error: {e}")
                 continue
-
-            # Store results using the best prediction
-            step_result = {
-                "Op_match": best_op_match,
-                "Ele_match": best_ele_match,
-                "Op_F1": [best_op_f1, gt_action["action"]],
-                "meta": item,
-            }
-
-            split = item.get("split", "unknown")
-            anno_id = item.get("anno_id", str(idx))
-            results[split][anno_id].append(step_result)
-
-            print(f"Best prediction: {best_action}")
-            print(f"Ground truth: {gt_action}")
-            print(f"Op match: {best_op_match}, Ele match: {best_ele_match}, Op F1: {best_op_f1}")
 
         # Calculate metrics
         final_metrics = {}
@@ -528,8 +538,8 @@ def main():
     PROCESSOR_PATH = os.environ.get("MIND2WEB_PROCESSOR")
     if not PROCESSOR_PATH:
         raise ValueError("MIND2WEB_PROCESSOR must be set to a local or Hugging Face processor path.")
-    LIMIT = int(os.environ.get("LIMIT", "100"))
-    TEMPERATURE = float(os.environ.get("TEMPERATURE", "1.0"))
+    LIMIT = int(os.environ.get("LIMIT", "-1"))
+    TEMPERATURE = float(os.environ.get("TEMPERATURE","0.7"))
     N_SAMPLING = int(os.environ.get("N_SAMPLING", "1"))
     TOP_K = int(os.environ.get("TOP_K", "50"))
     # Initialize Ray with error handling
