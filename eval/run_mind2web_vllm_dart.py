@@ -368,6 +368,77 @@ def calculate_mind2web_metrics(results):
     return metrics
 
 
+def _safe_filename_part(value):
+    value = os.path.basename(str(value).rstrip("/")) or "model"
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
+
+
+def _plain_results(results):
+    return {
+        split: {anno_id: steps for anno_id, steps in anno_results.items()}
+        for split, anno_results in results.items()
+    }
+
+
+def _count_result_steps(results):
+    return sum(
+        len(steps)
+        for anno_results in results.values()
+        for steps in anno_results.values()
+    )
+
+
+def _build_final_metrics(dataset_name, results):
+    final_metrics = {}
+    for split, split_results in results.items():
+        if _count_result_steps({split: split_results}) == 0:
+            continue
+        metrics = calculate_mind2web_metrics(split_results)
+
+        for metric_name, value in metrics.items():
+            if isinstance(value, list):
+                if metric_name == "Operation F1 categories":
+                    for i, category in enumerate(["CLICK", "TYPE", "SELECT"]):
+                        final_metrics[f"{dataset_name}/{split}/op_f1_{category}"] = value[i]
+            else:
+                final_metrics[f"{dataset_name}/{split}/{metric_name}"] = value
+    return final_metrics
+
+
+def _save_split_checkpoint(
+    checkpoint_dir,
+    model,
+    dataset_name,
+    results,
+    processed,
+    total,
+    status,
+):
+    try:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        model_name = _safe_filename_part(model)
+        path = os.path.join(
+            checkpoint_dir,
+            f"checkpoint_{model_name}_mind2web_{dataset_name}.json",
+        )
+        payload = {
+            "dataset": dataset_name,
+            "processed": processed,
+            "total": total,
+            "status": status,
+            "saved_steps": _count_result_steps(results),
+            "metrics": _build_final_metrics(dataset_name, results),
+            "results": _plain_results(results),
+        }
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(_json_safe(payload), f, indent=2)
+        os.replace(tmp_path, path)
+        print(f"Saved checkpoint to {path}")
+    except Exception as e:
+        print(f"Failed to save checkpoint for {dataset_name}: {e}")
+
+
 def evaluate_dataset(
     dataset_name: str,
     model: str,
@@ -378,6 +449,8 @@ def evaluate_dataset(
     temperature: float = 1,
     n_sampling: int = 3,
     top_k: int = 50,
+    checkpoint_every: int = 100,
+    checkpoint_dir: str = ".",
 ) -> Dict[str, Any]:
     """
     Evaluate a specific dataset type (task, website, or domain)
@@ -415,8 +488,13 @@ def evaluate_dataset(
         # Track results
         results = defaultdict(lambda: defaultdict(list))
 
-        # Process each sample
-        for idx, item in enumerate(dataset):
+        # Process each sample. Do not iterate the Dataset object directly:
+        # Mind2WebDataset.__getitem__ wraps idx by modulo, so direct iteration
+        # never raises IndexError and can loop forever when LIMIT=-1.
+        dataset_size = len(dataset)
+        max_samples = dataset_size if limit <= 0 else min(limit, dataset_size)
+        for idx in range(max_samples):
+            item = dataset[idx]
             if limit > 0 and idx >= limit:
                 break   
             data_dict, item = item
@@ -486,6 +564,8 @@ def evaluate_dataset(
                     "Op_match": best_op_match,
                     "Ele_match": best_ele_match,
                     "Op_F1": [best_op_f1, gt_action["action"]],
+                    "prediction": best_action,
+                    "sample_idx": idx,
                     "meta": item,
                 }
 
@@ -498,20 +578,32 @@ def evaluate_dataset(
                 print(f"Op match: {best_op_match}, Ele match: {best_ele_match}, Op F1: {best_op_f1}")
             except Exception as e:
                 print(f"Skipping sample {idx} due to evaluation error: {e}")
-                continue
+            finally:
+                processed = idx + 1
+                if checkpoint_every > 0 and (
+                    processed % checkpoint_every == 0 or processed == max_samples
+                ):
+                    _save_split_checkpoint(
+                        checkpoint_dir,
+                        model,
+                        dataset_name,
+                        results,
+                        processed,
+                        max_samples,
+                        "running" if processed < max_samples else "completed",
+                    )
 
         # Calculate metrics
-        final_metrics = {}
-        for split, _ in results.items():
-            metrics = calculate_mind2web_metrics(results[split])
-
-            for metric_name, value in metrics.items():
-                if isinstance(value, list):
-                    if metric_name == "Operation F1 categories":
-                        for i, category in enumerate(["CLICK", "TYPE", "SELECT"]):
-                            final_metrics[f"{dataset_name}/{split}/op_f1_{category}"] = value[i]
-                else:
-                    final_metrics[f"{dataset_name}/{split}/{metric_name}"] = value
+        final_metrics = _build_final_metrics(dataset_name, results)
+        _save_split_checkpoint(
+            checkpoint_dir,
+            model,
+            dataset_name,
+            results,
+            max_samples,
+            max_samples,
+            "completed",
+        )
 
         return final_metrics
 
@@ -542,6 +634,8 @@ def main():
     TEMPERATURE = float(os.environ.get("TEMPERATURE","0.7"))
     N_SAMPLING = int(os.environ.get("N_SAMPLING", "1"))
     TOP_K = int(os.environ.get("TOP_K", "50"))
+    CHECKPOINT_EVERY = int(os.environ.get("MIND2WEB_CHECKPOINT_EVERY", "100"))
+    CHECKPOINT_DIR = os.environ.get("MIND2WEB_CHECKPOINT_DIR", ".")
     # Initialize Ray with error handling
     try:
         # List of dataset types to evaluate
@@ -562,6 +656,8 @@ def main():
                     TEMPERATURE,
                     N_SAMPLING,
                     TOP_K,
+                    CHECKPOINT_EVERY,
+                    CHECKPOINT_DIR,
                 )
                 futures.append(future)
             all_metrics = ray.get(futures)
@@ -578,6 +674,8 @@ def main():
                     TEMPERATURE,
                     N_SAMPLING,
                     TOP_K,
+                    CHECKPOINT_EVERY,
+                    CHECKPOINT_DIR,
                 )
                 for dataset_type in dataset_types
             ]
@@ -588,7 +686,9 @@ def main():
             if dataset_metrics:  # Check if metrics exist
                 final_metrics.update(dataset_metrics)
 
-        with open(f"results_{MODEL}_mind2web.json", "w") as f:
+        result_name = f"results_{_safe_filename_part(MODEL)}_mind2web.json"
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        with open(os.path.join(CHECKPOINT_DIR, result_name), "w") as f:
             json.dump(_json_safe(final_metrics), f, indent=4)
 
     except Exception as e:
