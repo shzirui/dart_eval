@@ -373,6 +373,14 @@ def _safe_filename_part(value):
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", value)
 
 
+def _checkpoint_path(checkpoint_dir, model, dataset_name):
+    model_name = _safe_filename_part(model)
+    return os.path.join(
+        checkpoint_dir,
+        f"checkpoint_{model_name}_mind2web_{dataset_name}.json",
+    )
+
+
 def _plain_results(results):
     return {
         split: {anno_id: steps for anno_id, steps in anno_results.items()}
@@ -416,11 +424,7 @@ def _save_split_checkpoint(
 ):
     try:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        model_name = _safe_filename_part(model)
-        path = os.path.join(
-            checkpoint_dir,
-            f"checkpoint_{model_name}_mind2web_{dataset_name}.json",
-        )
+        path = _checkpoint_path(checkpoint_dir, model, dataset_name)
         payload = {
             "dataset": dataset_name,
             "processed": processed,
@@ -439,6 +443,35 @@ def _save_split_checkpoint(
         print(f"Failed to save checkpoint for {dataset_name}: {e}")
 
 
+def _load_split_checkpoint(checkpoint_dir, model, dataset_name, total):
+    path = _checkpoint_path(checkpoint_dir, model, dataset_name)
+    if not os.path.exists(path):
+        return None, 0
+
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+
+        if payload.get("dataset") != dataset_name:
+            print(f"Ignoring checkpoint with mismatched dataset: {path}")
+            return None, 0
+        if int(payload.get("total", -1)) != int(total):
+            print(f"Ignoring checkpoint with mismatched total: {path}")
+            return None, 0
+
+        restored = defaultdict(lambda: defaultdict(list))
+        for split, anno_results in payload.get("results", {}).items():
+            for anno_id, steps in anno_results.items():
+                restored[split][anno_id] = steps
+
+        processed = min(max(int(payload.get("processed", 0)), 0), total)
+        print(f"Resuming {dataset_name} from checkpoint {path}; processed={processed}/{total}")
+        return restored, processed
+    except Exception as e:
+        print(f"Failed to load checkpoint for {dataset_name}: {e}")
+        return None, 0
+
+
 def evaluate_dataset(
     dataset_name: str,
     model: str,
@@ -451,6 +484,7 @@ def evaluate_dataset(
     top_k: int = 50,
     checkpoint_every: int = 100,
     checkpoint_dir: str = ".",
+    resume: bool = False,
 ) -> Dict[str, Any]:
     """
     Evaluate a specific dataset type (task, website, or domain)
@@ -485,15 +519,39 @@ def evaluate_dataset(
             },
         )
 
-        # Track results
-        results = defaultdict(lambda: defaultdict(list))
-
         # Process each sample. Do not iterate the Dataset object directly:
         # Mind2WebDataset.__getitem__ wraps idx by modulo, so direct iteration
         # never raises IndexError and can loop forever when LIMIT=-1.
         dataset_size = len(dataset)
         max_samples = dataset_size if limit <= 0 else min(limit, dataset_size)
-        for idx in range(max_samples):
+
+        # Track results
+        results = defaultdict(lambda: defaultdict(list))
+        start_idx = 0
+        if resume:
+            loaded_results, loaded_processed = _load_split_checkpoint(
+                checkpoint_dir,
+                model,
+                dataset_name,
+                max_samples,
+            )
+            if loaded_results is not None:
+                results = loaded_results
+                start_idx = loaded_processed
+                if start_idx >= max_samples:
+                    print(f"{dataset_name} checkpoint already completed; skipping evaluation.")
+                    _save_split_checkpoint(
+                        checkpoint_dir,
+                        model,
+                        dataset_name,
+                        results,
+                        max_samples,
+                        max_samples,
+                        "completed",
+                    )
+                    return _build_final_metrics(dataset_name, results)
+
+        for idx in range(start_idx, max_samples):
             item = dataset[idx]
             if limit > 0 and idx >= limit:
                 break   
@@ -636,6 +694,7 @@ def main():
     TOP_K = int(os.environ.get("TOP_K", "50"))
     CHECKPOINT_EVERY = int(os.environ.get("MIND2WEB_CHECKPOINT_EVERY", "100"))
     CHECKPOINT_DIR = os.environ.get("MIND2WEB_CHECKPOINT_DIR", ".")
+    RESUME = os.environ.get("MIND2WEB_RESUME", "0").lower() in ["1", "true", "yes"]
     # Initialize Ray with error handling
     try:
         # List of dataset types to evaluate
@@ -658,6 +717,7 @@ def main():
                     TOP_K,
                     CHECKPOINT_EVERY,
                     CHECKPOINT_DIR,
+                    RESUME,
                 )
                 futures.append(future)
             all_metrics = ray.get(futures)
@@ -676,6 +736,7 @@ def main():
                     TOP_K,
                     CHECKPOINT_EVERY,
                     CHECKPOINT_DIR,
+                    RESUME,
                 )
                 for dataset_type in dataset_types
             ]
